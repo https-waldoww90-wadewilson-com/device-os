@@ -540,11 +540,11 @@ public:
 	/**
 	 * Clear the message stores when the channel is initially established.
 	 */
-	ProtocolError establish(uint32_t& flags, uint32_t app_crc) override
+	ProtocolError establish(uint32_t& flags, const AppStateDescriptor& app_state) override
 	{
 		server.clear();
 		client.clear();
-		return channel::establish(flags, app_crc);
+		return channel::establish(flags, app_state);
 	}
 
 	/**
