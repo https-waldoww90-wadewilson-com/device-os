@@ -289,6 +289,10 @@ protected:
 	 * Updates the cached crc of subscriptions registered with the cloud.
 	 */
 	void update_subscription_crc();
+	/**
+	 * Updates the cached protocol flags.
+	 */
+	void update_protocol_flags();
 
 	/**
 	 * Returns the descriptor of the current application state.
