@@ -335,6 +335,17 @@ size_t Messages::coded_ack(uint8_t* buf, uint8_t token, uint8_t code,
     return sz;
 }
 
+size_t Messages::description(unsigned char *buf, message_id_t message_id, token_t token, bool confirmable)
+{
+	buf[0] = confirmable ? 0x41 : 0x51; // confirmable/non-confirmable, one-byte token
+	buf[1] = CoAPCode::CONTENT;
+	buf[2] = (message_id >> 8) & 0xff;
+	buf[3] = message_id & 0xff;
+	buf[4] = token;
+	buf[5] = 0xff;
+	return 6;
+}
+
 size_t Messages::response_size(size_t payload_size, bool has_token)
 {
 	return 4 + // Message header

@@ -147,10 +147,7 @@ public:
         return separate_response_with_payload(buf, message_id, token, code, NULL, 0, confirmable);
     }
 
-    static inline size_t description(unsigned char *buf, message_id_t message_id, token_t token)
-    {
-        return content(buf, message_id, token);
-    }
+    static size_t description(unsigned char *buf, message_id_t message_id, token_t token, bool confirmable);
 
     /**
      * Returns the size of a response message (an ACK or a separate response) without options.
