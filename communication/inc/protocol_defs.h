@@ -102,11 +102,17 @@ enum DescriptionType {
 
 namespace Connection
 {
+
+/**
+ * Connection properties.
+ */
 enum Enum
 {
-    PING = 0,
-    FAST_OTA = 1
+    PING = 0, ///< Set keepalive interval.
+    FAST_OTA = 1, ///< Enable/disable fast OTA.
+    DEVICE_INITIATED_DESCRIBE = 2 ///< Enable/disable device-initiated describe messages.
 };
+
 }
 
 typedef std::function<system_tick_t()> millis_callback;
@@ -239,6 +245,18 @@ public:
         return true;
     }
 
+    /**
+     * Returns the state flags.
+     */
+    uint32_t stateFlags() const {
+        return stateFlags_;
+    }
+
+    /**
+     * Returns `true` if this descriptor is empty, otherwise returns `false`.
+     *
+     * An empty descriptor has all state flags cleared.
+     */
     bool isEmpty() const {
         return !stateFlags_;
     }
