@@ -47,7 +47,7 @@ class Messages
 {
 public:
 	static CoAPMessageType::Enum decodeType(const uint8_t* buf, size_t length);
-	static size_t describe_post_header(uint8_t buf[], size_t buffer_size, uint16_t message_id, uint8_t desc_flags);
+	static size_t describe_post_header(uint8_t* buf, size_t buffer_size, message_id_t message_id, token_t token, uint8_t desc_flags);
 	static size_t hello(uint8_t* buf, message_id_t message_id, uint8_t flags,
 			uint16_t platform_id, uint16_t product_id,
 			uint16_t product_firmware_version, bool confirmable, const uint8_t* device_id, uint16_t device_id_len);
@@ -147,7 +147,7 @@ public:
         return separate_response_with_payload(buf, message_id, token, code, NULL, 0, confirmable);
     }
 
-    static size_t description(unsigned char *buf, message_id_t message_id, token_t token, bool confirmable);
+    static size_t description_response(unsigned char *buf, message_id_t message_id, token_t token);
 
     /**
      * Returns the size of a response message (an ACK or a separate response) without options.

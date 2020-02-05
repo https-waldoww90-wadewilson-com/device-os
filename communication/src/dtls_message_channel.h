@@ -158,7 +158,7 @@ private:
 		}
 	}
 
-	virtual AppStateDescriptor app_state_descriptor() const override;
+	virtual AppStateDescriptor cached_app_state_descriptor() const override;
 };
 
 

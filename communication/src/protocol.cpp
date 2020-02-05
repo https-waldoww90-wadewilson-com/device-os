@@ -25,8 +25,22 @@ LOG_SOURCE_CATEGORY("comm.protocol")
 #include "chunked_transfer.h"
 #include "subscriptions.h"
 #include "functions.h"
+#include "mbedtls_util.h"
 
 namespace particle { namespace protocol {
+
+namespace {
+
+enum HelloFlag {
+	HELLO_FLAG_OTA_UPGRADE_SUCCESSFUL = 0x01,
+	HELLO_FLAG_DIAGNOSTICS_SUPPORT = 0x02,
+	HELLO_FLAG_IMMEDIATE_UPDATES_SUPPORT = 0x04,
+	// Flags 0x08 and 0x10 are reserved to indicate the support for the HandshakeComplete and Goodbye
+	// messages respectively
+	HELLO_FLAG_DEVICE_INITIATED_DESCRIBE = 0x20
+};
+
+} // namespace
 
 /**
  * Sends an empty acknowledgement for the given message
@@ -59,6 +73,27 @@ ProtocolError Protocol::handle_received_message(Message& message,
 	message_id_t msg_id = CoAP::message_id(queue);
 	CoAPCode::Enum code = CoAP::code(queue);
 	CoAPType::Enum type = CoAP::type(queue);
+	if (token_len > 0 && code >= CoAPCode::OK && code < CoAPCode::BAD_REQUEST) {
+		if (app_describe_token && app_describe_token == token) {
+			app_describe_token = 0;
+			if (descriptor.app_state_selector_info) {
+				// Update the application state's CRC in the session data
+				descriptor.app_state_selector_info(SparkAppStateSelector::DESCRIBE_APP,
+						SparkAppStateUpdate::COMPUTE_AND_PERSIST, 0, nullptr);
+			}
+		}
+		if (system_describe_token && system_describe_token == token) {
+			system_describe_token = 0;
+			if (descriptor.app_state_selector_info) {
+				// Update the system state's CRC in the session data
+				descriptor.app_state_selector_info(SparkAppStateSelector::DESCRIBE_SYSTEM,
+						SparkAppStateUpdate::COMPUTE_AND_PERSIST, 0, nullptr);
+			}
+		}
+		if (subscriptions_token && subscriptions_token == token) {
+			subscriptions_token = 0;
+		}
+	}
 	if (CoAPType::is_reply(type)) {
 		LOG(TRACE, "Reply recieved: type=%d, code=%d", type, code);
 		// todo - this is a little too simple in the case of an empty ACK for a separate response
@@ -85,7 +120,7 @@ ProtocolError Protocol::handle_received_message(Message& message,
 		} else if (message.length() > 8) {
 			LOG(WARN, "Invalid DESCRIBE flags %02x", queue[8]);
 		}
-		error = send_description(token, msg_id, descriptor_type);
+		error = send_description_response(token, msg_id, descriptor_type);
 		break;
 	}
 
@@ -250,6 +285,9 @@ void Protocol::init(const SparkCallbacks &callbacks,
 	copy_and_init(&this->descriptor, sizeof(this->descriptor), &descriptor,
 			descriptor.size);
 
+	// TODO: Ideally, the next token value should be stored in the session data
+	mbedtls_default_rng(nullptr, &next_token, sizeof(next_token));
+
 	chunkedTransferCallbacks.init(&this->callbacks);
 	chunkedTransfer.init(&chunkedTransferCallbacks);
 
@@ -272,24 +310,21 @@ void Protocol::update_protocol_flags()
 	if (descriptor.app_state_selector_info)
 	{
 		this->channel.command(Channel::SAVE_SESSION);
-		descriptor.app_state_selector_info(SparkAppStateSelector::PROTOCOL_FLAGS, SparkAppStateUpdate::PERSIST, flags, nullptr);
+		descriptor.app_state_selector_info(SparkAppStateSelector::PROTOCOL_FLAGS, SparkAppStateUpdate::PERSIST, protocol_flags, nullptr);
 		this->channel.command(Channel::LOAD_SESSION);
 	}
 }
 
 AppStateDescriptor Protocol::app_state_descriptor()
 {
-	AppStateDescriptor d;
-	if (descriptor.app_state_selector_info) {
-		d.protocolFlags(flags);
-		d.systemDescribeCrc(descriptor.app_state_selector_info(SparkAppStateSelector::DESCRIBE_SYSTEM, SparkAppStateUpdate::COMPUTE, 0, nullptr));
-		if (!(flags & Flags::DEVICE_INITIATED_DESCRIBE)) {
-			// Include application state in the descriptor
-			d.appDescribeCrc(descriptor.app_state_selector_info(SparkAppStateSelector::DESCRIBE_APP, SparkAppStateUpdate::COMPUTE, 0, nullptr));
-			d.subscriptionsCrc(subscriptions.compute_subscriptions_checksum(callbacks.calculate_crc));
-		}
+	if (!descriptor.app_state_selector_info) {
+		return AppStateDescriptor();
 	}
-	return d;
+	return AppStateDescriptor()
+		.systemDescribeCrc(descriptor.app_state_selector_info(SparkAppStateSelector::DESCRIBE_SYSTEM, SparkAppStateUpdate::COMPUTE, 0, nullptr))
+		.appDescribeCrc(descriptor.app_state_selector_info(SparkAppStateSelector::DESCRIBE_APP, SparkAppStateUpdate::COMPUTE, 0, nullptr))
+		.subscriptionsCrc(subscriptions.compute_subscriptions_checksum(callbacks.calculate_crc))
+		.protocolFlags(protocol_flags);
 }
 
 /**
@@ -306,6 +341,9 @@ int Protocol::begin()
 	// FIXME: Pending completion handlers should be cancelled at the end of a previous session
 	ack_handlers.clear();
 	last_ack_handlers_update = callbacks.millis();
+	app_describe_token = 0;
+	system_describe_token = 0;
+	subscriptions_token = 0;
 
 	ProtocolError error = channel.establish();
 	const bool session_resumed = (error == SESSION_RESUMED);
@@ -320,9 +358,13 @@ int Protocol::begin()
 		channel.command(MessageChannel::MOVE_SESSION, nullptr);
 
 		const auto currentState = app_state_descriptor();
-		const auto cachedState = channel.app_state_descriptor();
-		if (currentState.equalsTo(cachedState, currentState.stateFlags()))
-		{
+		const auto cachedState = channel.cached_app_state_descriptor();
+		uint32_t stateFlags = AppStateDescriptor::ALL;
+		if (protocol_flags & ProtocolFlag::DEVICE_INITIATED_DESCRIBE) {
+			// The system controls when to send an application describe message
+			stateFlags = AppStateDescriptor::SYSTEM_DESCRIBE_CRC | AppStateDescriptor::PROTOCOL_FLAGS;
+		}
+		if (cachedState.equalsTo(currentState, stateFlags)) {
 			LOG(INFO, "Skipping HELLO message");
 			const auto r = ping(true);
 			if (r != NO_ERROR) {
@@ -344,22 +386,25 @@ int Protocol::begin()
 		return error;
 	}
 
-	if (flags & REQUIRE_HELLO_RESPONSE) {
+	if (protocol_flags & ProtocolFlag::REQUIRE_HELLO_RESPONSE) {
 		LOG(INFO,"Receiving HELLO response");
 		error = hello_response();
-		if (error)
+		if (error) {
 			return error;
+		}
 	}
-	update_protocol_flags();
 
 	LOG(INFO,"Handshake completed");
 	channel.notify_established();
+	update_protocol_flags();
+
+	if (protocol_flags & ProtocolFlag::DEVICE_INITIATED_DESCRIBE) {
+		// Send a system describe message automatically
+		error = post_description(DescriptionType::DESCRIBE_SYSTEM, true /* force */);
+	}
+
 	return error;
 }
-
-const auto HELLO_FLAG_OTA_UPGRADE_SUCCESSFUL = 1;
-const auto HELLO_FLAG_DIAGNOSTICS_SUPPORT = 2;
-const auto HELLO_FLAG_IMMEDIATE_UPDATES_SUPPORT = 4;
 
 /**
  * Send the hello message over the channel.
@@ -370,9 +415,14 @@ ProtocolError Protocol::hello(bool was_ota_upgrade_successful)
 	Message message;
 	channel.create(message);
 
-	uint8_t flags = was_ota_upgrade_successful ? HELLO_FLAG_OTA_UPGRADE_SUCCESSFUL : 0;
-	flags |= HELLO_FLAG_DIAGNOSTICS_SUPPORT | HELLO_FLAG_IMMEDIATE_UPDATES_SUPPORT;
-	size_t len = build_hello(message, flags);
+	uint8_t hello_flags = HELLO_FLAG_DIAGNOSTICS_SUPPORT | HELLO_FLAG_IMMEDIATE_UPDATES_SUPPORT;
+	if (was_ota_upgrade_successful) {
+		hello_flags |= HELLO_FLAG_OTA_UPGRADE_SUCCESSFUL;
+	}
+	if (protocol_flags & ProtocolFlag::DEVICE_INITIATED_DESCRIBE) {
+		hello_flags |= HELLO_FLAG_DEVICE_INITIATED_DESCRIBE;
+	}
+	size_t len = build_hello(message, hello_flags);
 	message.set_length(len);
 	message.set_confirm_received(true); // Send synchronously
 	last_message_millis = callbacks.millis();
@@ -589,22 +639,37 @@ ProtocolError Protocol::generate_and_send_description(MessageChannel& channel, M
     return error;
 }
 
-ProtocolError Protocol::post_description(int desc_flags)
+ProtocolError Protocol::post_description(int desc_flags, bool force)
 {
-    Message message;
-    channel.create(message);
-    const size_t header_size =
-        Messages::describe_post_header(message.buf(), message.capacity(), 0, (desc_flags & 0xFF));
-
-    return generate_and_send_description(channel, message, header_size, desc_flags);
+	if (!force) {
+		const auto currentState = app_state_descriptor();
+		const auto cachedState = channel.cached_app_state_descriptor();
+		if ((desc_flags & DescriptionType::DESCRIBE_SYSTEM) &&
+				currentState.equalsTo(cachedState, AppStateDescriptor::SYSTEM_DESCRIBE_CRC)) {
+			desc_flags &= ~DescriptionType::DESCRIBE_SYSTEM;
+			LOG(INFO, "Not sending system DESCRIBE");
+		}
+		if ((desc_flags & DescriptionType::DESCRIBE_APPLICATION) &&
+				currentState.equalsTo(cachedState, AppStateDescriptor::APP_DESCRIBE_CRC)) {
+			desc_flags &= ~DescriptionType::DESCRIBE_APPLICATION;
+			LOG(INFO, "Not sending application DESCRIBE");
+		}
+	}
+	if (!desc_flags) {
+		return ProtocolError::NO_ERROR;
+	}
+	Message message;
+	const ProtocolError error = channel.create(message);
+	if (error != ProtocolError::NO_ERROR) {
+		return error;
+	}
+	const token_t token = get_next_token();
+	const size_t header_size = Messages::describe_post_header(message.buf(), message.capacity(), 0 /* message_id */,
+			token, desc_flags);
+	return generate_and_send_description(channel, message, header_size, desc_flags);
 }
 
-/**
- * Produces and transmits (PIGGYBACK) a describe message.
- * @param desc_flags Flags describing the information to provide. A combination of {@code
- * DESCRIBE_APPLICATION) and {@code DESCRIBE_SYSTEM) flags.
- */
-ProtocolError Protocol::send_description(token_t token, message_id_t msg_id, int desc_flags)
+ProtocolError Protocol::send_description_response(token_t token, message_id_t msg_id, int desc_flags)
 {
 	// Acknowledge the request
 	Message msg;
@@ -616,13 +681,13 @@ ProtocolError Protocol::send_description(token_t token, message_id_t msg_id, int
 	if (error != ProtocolError::NO_ERROR) {
 		return error;
 	}
-	// Send a reply
+	// Send a response
 	error = channel.create(msg);
 	if (error != ProtocolError::NO_ERROR) {
 		return error;
 	}
 	const auto buf = msg.buf();
-	const size_t size = Messages::description(buf, 0 /* message_id */, token, channel.is_unreliable());
+	const size_t size = Messages::description_response(buf, 0 /* message_id */, token);
 	return generate_and_send_description(channel, msg, size, desc_flags);
 }
 
@@ -673,13 +738,13 @@ int Protocol::mesh_command(MeshCommand::Enum cmd, uint32_t data, void* extraData
 	LOG(INFO, "handling mesh command %d", cmd);
 	switch(cmd) {
 	case MeshCommand::NETWORK_CREATED:
-		return mesh.network_update(*this, next_token(), channel, true, *(MeshCommand::NetworkInfo*)extraData, completion);
+		return mesh.network_update(*this, get_next_token(), channel, true, *(MeshCommand::NetworkInfo*)extraData, completion);
 	case MeshCommand::NETWORK_UPDATED:
-		return mesh.network_update(*this, next_token(), channel, false, *(MeshCommand::NetworkInfo*)extraData, completion);
+		return mesh.network_update(*this, get_next_token(), channel, false, *(MeshCommand::NetworkInfo*)extraData, completion);
 	case MeshCommand::DEVICE_MEMBERSHIP:
-		return mesh.device_joined(*this, next_token(), channel, data, *(MeshCommand::NetworkUpdate*)extraData, completion);
+		return mesh.device_joined(*this, get_next_token(), channel, data, *(MeshCommand::NetworkUpdate*)extraData, completion);
 	case MeshCommand::DEVICE_BORDER_ROUTER:
-		return mesh.device_gateway(*this, next_token(), channel, data, *(MeshCommand::NetworkUpdate*)extraData, completion);
+		return mesh.device_gateway(*this, get_next_token(), channel, data, *(MeshCommand::NetworkUpdate*)extraData, completion);
 	default:
 		return completion_result(SYSTEM_ERROR_INVALID_ARGUMENT, completion);
 	}
